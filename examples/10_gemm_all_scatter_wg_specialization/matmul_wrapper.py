@@ -7,11 +7,16 @@ import triton
 # from streamk_kernel import streamk_gemm
 from gemm_all_scatter_wg_specialization import (
     persistent_gemm_all_scatter_wg_specialization,
+    persistent_gemm_all_scatter_wg_specialization_spatial,
 )
 from examples.common.utils import is_triton_interpret_set
 import iris
 
-gemm_kernel = persistent_gemm_all_scatter_wg_specialization
+kernel_variants = {
+    "baseline": persistent_gemm_all_scatter_wg_specialization,
+    "spatial": persistent_gemm_all_scatter_wg_specialization_spatial,
+}
+gemm_kernel = persistent_gemm_all_scatter_wg_specialization_spatial
 
 
 class matmul(torch.autograd.Function):
@@ -66,6 +71,7 @@ class matmul(torch.autograd.Function):
         gemm_map_xcd: torch.Tensor = None,
         comm_map_wgid: torch.Tensor = None,
         comm_map_xcd: torch.Tensor = None,
+        kernel_variant: str = "spatial",
     ):
         # checks constraints
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -89,7 +95,11 @@ class matmul(torch.autograd.Function):
 
         # compute grid (work to do per SM on the first wave)
         stride_bias = bias.stride(0) if use_bias else 0
-        kk = gemm_kernel[(num_sms,)](
+        kernel = kernel_variants.get(kernel_variant)
+        if kernel is None:
+            raise ValueError(f"Unknown kernel_variant '{kernel_variant}', expected one of {list(kernel_variants.keys())}.")
+
+        kk = kernel[(num_sms,)](
             a,
             b,
             c,
@@ -169,6 +179,7 @@ class matmul(torch.autograd.Function):
         gemm_map_xcd: torch.Tensor = None,
         comm_map_wgid: torch.Tensor = None,
         comm_map_xcd: torch.Tensor = None,
+        kernel_variant: str = "spatial",
     ):
         matmul._call(
             a=a,
@@ -195,6 +206,7 @@ class matmul(torch.autograd.Function):
             gemm_map_wgid=gemm_map_wgid,
             gemm_map_xcd=gemm_map_xcd,
             comm_map_wgid=comm_map_wgid,
-            comm_map_xcd=comm_map_xcd
+            comm_map_xcd=comm_map_xcd,
+            kernel_variant=kernel_variant,
         )
         return c, gemm_map_wgid, gemm_map_xcd, comm_map_wgid, comm_map_xcd

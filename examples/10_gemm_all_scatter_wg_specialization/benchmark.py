@@ -48,9 +48,10 @@ def parse_args():
         description="Parse matrix dimensions and configuration.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-m", type=int, default=8192, help="Number of rows in matrix A")
-    parser.add_argument("-n", type=int, default=3584, help="Number of columns in matrix B")
-    # parser.add_argument("-n", type=int, default=4608, help="Number of columns in matrix B")
+    # parser.add_argument("-m", type=int, default=8192*2, help="Number of rows in matrix A")
+    parser.add_argument("-m", type=int, default=3584, help="Number of rows in matrix A")
+    parser.add_argument("-n", type=int, default=2048, help="Number of columns in matrix B")
+    # parser.add_argument("-n", type=int, default=4608*4, help="Number of columns in matrix B")
     parser.add_argument("-k", type=int, default=36864, help="Common dimension between matrices A and B")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
@@ -88,6 +89,13 @@ def parse_args():
     )
     parser.add_argument("--num_stages", type=int, default=2, help="Number of stages")
     parser.add_argument("-r", "--num_ranks", type=int, default=2, help="Number of ranks/processes")
+    parser.add_argument(
+        "--kernel_variant",
+        type=str,
+        default="spatial",
+        choices=["baseline", "spatial"],
+        help="Choose between baseline and spatial workgroup specialization",
+    )
 
     return vars(parser.parse_args())
 
@@ -208,31 +216,32 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         with torch.cuda.stream(gemm_stream):
             kernel_timing["gemm"]["start_event"].record()
             local_C, gemm_map_wgid, gemm_map_xcd, comm_map_wgid, comm_map_xcd = matmul.apply(
-                local_A,
-                local_B,
-                local_C,
-                global_C,
-                bias,
-                locks,
-                rank,
-                world_size,
-                args["gemm_sms"],
-                args["num_sms"],
-                args["BLK_M"],
-                args["BLK_N"],
-                args["BLK_K"],
-                args["gsize_m"],
-                args["num_stages"],
-                shmem.get_heap_bases(),
-                "gfx942",
-                args["trace_tiles"],
-                timestamps.mm_begin_timestamp,
-                timestamps.mm_end_timestamp,
-                SHOW_MAP,
-                gemm_map_wgid,
-                gemm_map_xcd,
-                comm_map_wgid,
-                comm_map_xcd
+                local_A,                         # a
+                local_B,                         # b
+                local_C,                         # c
+                global_C,                        # c_global
+                bias,                            # bias
+                locks,                           # locks
+                rank,                            # rank
+                world_size,                      # world_size
+                args["gemm_sms"],                # gemm_sms
+                args["num_sms"],                 # num_sms
+                args["BLK_M"],                   # BLK_M
+                args["BLK_N"],                   # BLK_N
+                args["BLK_K"],                   # BLK_K
+                args["gsize_m"],                 # gsize_m
+                args["num_stages"],              # num_stages
+                shmem.get_heap_bases(),          # heap_bases_ptr
+                "gfx942",                        # arch
+                args["trace_tiles"],             # COLLECT_TIMESTAMPS
+                timestamps.mm_begin_timestamp,   # mm_begin_timestamp
+                timestamps.mm_end_timestamp,     # mm_end_timestamp
+                SHOW_MAP,                        # SHOW_MAP
+                gemm_map_wgid,                   # gemm_map_wgid
+                gemm_map_xcd,                    # gemm_map_xcd
+                comm_map_wgid,                   # comm_map_wgid
+                comm_map_xcd,                    # comm_map_xcd
+                args["kernel_variant"],          # kernel_variant
             )
             kernel_timing["gemm"]["end_event"].record()
             kernel_timing["gemm"]["experiments"] += 1
