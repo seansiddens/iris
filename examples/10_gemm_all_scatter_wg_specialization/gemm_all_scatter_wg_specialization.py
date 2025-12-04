@@ -46,8 +46,12 @@ def persistent_gemm_all_scatter_wg_specialization(
     COLLECT_TIMESTAMPS: tl.constexpr = False,
     mm_begin_timestamp_ptr: tl.tensor = None,
     mm_end_timestamp_ptr: tl.tensor = None,
+    SHOW_MAP: tl.constexpr = False,
+    gemm_map: tl.tensor = None,
+    comm_map: tl.tensor = None,
 ):
     pid = tl.program_id(0)
+    original_pid = pid # Cache the original wid which dictates XCD affinity
 
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
@@ -70,9 +74,11 @@ def persistent_gemm_all_scatter_wg_specialization(
     # kernel.
     if pid < GEMM_SMS:
         for tile_id in range(pid, total_tiles, GEMM_SMS):
+            # Don't care about reuse scross this loop iter because these are different timesteps? 
             if COLLECT_TIMESTAMPS:
                 timestamp = read_realtime()
                 tl.atomic_min(mm_begin_timestamp_ptr + tile_id, timestamp)
+
 
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
             group_id = tile_id // num_pid_in_group
@@ -80,6 +86,10 @@ def persistent_gemm_all_scatter_wg_specialization(
             group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
             pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+            if SHOW_MAP:
+                # Show which hardware WG maps to what logical tile ID for GEMM computation.
+                tl.store(gemm_map + (pid_m * num_pid_n + pid_n), original_pid)
 
             rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
             rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -141,20 +151,28 @@ def persistent_gemm_all_scatter_wg_specialization(
                 timestamp = read_realtime()
                 tl.atomic_max(mm_end_timestamp_ptr + tile_id, timestamp)
 
+            # TODO: We can remove the cache modifiers here once we ensure that GEMM and COMM CUs are on the same XCD.
             tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
             tl.debug_barrier()
             tl.store(locks + tile_id, 1, cache_modifier=".wt")
 
-    else:  # pid >= GEMM_SMS
-        COMM_SMS = NUM_SMS - GEMM_SMS
-        pid = pid - GEMM_SMS
+    else:  
+        # original_pid >= GEMM_SMS
+        COMM_SMS = NUM_SMS - GEMM_SMS # 32
+        pid = pid - GEMM_SMS  # Remap from [224, 255] to [0, 31]
         for tile_id in range(pid, total_tiles, COMM_SMS):
+            # Each COMM WG is responsible for waiting on total_tiles // COMM_SMs tiles. 
+            # 896 // 32 = 28
+
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
             group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
             pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+            if SHOW_MAP:
+                tl.store(comm_map + (pid_m * num_pid_n + pid_n), original_pid)
 
             # Begin: See the if segment for explanation:
             rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M

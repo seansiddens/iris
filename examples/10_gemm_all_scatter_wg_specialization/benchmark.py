@@ -23,6 +23,35 @@ from matmul_wrapper import matmul
 torch.manual_seed(123)
 random.seed(123)
 
+SHOW_MAP = True
+
+
+def print_grid(values, height, width):
+    """Pretty-print a 2D grid of values laid out row-major."""
+    # Calculate the maximum width needed for any value
+    max_val = max(values) if values else 0
+    cell_width = len(str(max_val))
+    
+    rows = []
+    for r in range(height):
+        row_vals = values[r * width : (r + 1) * width]
+        rows.append(" ".join(f"{v:{cell_width}d}" for v in row_vals))
+    grid_str = "\n".join(rows)
+    print(grid_str)
+
+
+def print_xcd_grid(values, height, width):
+    """Pretty-print a 2D grid showing XCD assignments (value % 8)."""
+    # XCD values are 0-7, so cell width is always 1
+    cell_width = 1
+    
+    rows = []
+    for r in range(height):
+        row_vals = values[r * width : (r + 1) * width]
+        rows.append(" ".join(f"{v % 8:{cell_width}d}" for v in row_vals))
+    grid_str = "\n".join(rows)
+    print(grid_str)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -30,7 +59,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-m", type=int, default=8192, help="Number of rows in matrix A")
-    parser.add_argument("-n", type=int, default=4608, help="Number of columns in matrix B")
+    parser.add_argument("-n", type=int, default=3584, help="Number of columns in matrix B")
+    # parser.add_argument("-n", type=int, default=4608, help="Number of columns in matrix B")
     parser.add_argument("-k", type=int, default=36864, help="Common dimension between matrices A and B")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
@@ -134,6 +164,14 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     total_blocks_M = triton.cdiv(args["m"], args["BLK_M"])
     total_blocks_N = triton.cdiv(args["n"], args["BLK_N"])
     total_tiles = total_blocks_M * total_blocks_N
+    print(f"Total tiles: {total_tiles}, total_blocks_M: {total_blocks_M}, total_blocks_N: {total_blocks_N}")
+
+    if SHOW_MAP:
+        gemm_map = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        comm_map = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+    else: 
+        gemm_map = None
+        comm_map = None
 
     locks = shmem.zeros((total_tiles,), device="cuda", dtype=torch.int8)
 
@@ -159,6 +197,8 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     def run_experiment():
         nonlocal local_C
         nonlocal global_C
+        nonlocal gemm_map
+        nonlocal comm_map
         nonlocal kernel_timing
 
         shmem.barrier()
@@ -171,7 +211,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         torch.cuda.nvtx.range_push("GEMM")
         with torch.cuda.stream(gemm_stream):
             kernel_timing["gemm"]["start_event"].record()
-            local_C = matmul.apply(
+            local_C, gemm_map, comm_map = matmul.apply(
                 local_A,
                 local_B,
                 local_C,
@@ -192,6 +232,9 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
                 args["trace_tiles"],
                 timestamps.mm_begin_timestamp,
                 timestamps.mm_end_timestamp,
+                SHOW_MAP,
+                gemm_map,
+                comm_map
             )
             kernel_timing["gemm"]["end_event"].record()
             kernel_timing["gemm"]["experiments"] += 1
@@ -237,6 +280,37 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
             json_writer.add_field("gemm_registers", gemm_registers)
             json_writer.add_field("gemm_spills", gemm_spills)
+
+        # Print GEMM and COMM maps if enabled
+        if SHOW_MAP and rank == 0:
+            gemm_map_cpu = gemm_map.cpu().tolist()
+            comm_map_cpu = comm_map.cpu().tolist()
+            
+            print("\n" + "="*80)
+            print(f"GEMM Map - Workgroup Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("="*80)
+            print_grid(gemm_map_cpu, total_blocks_M, total_blocks_N)
+
+            print("\n" + "="*80)
+            print(f"COMM Map - Workgroup Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("="*80)
+            print_grid(comm_map_cpu, total_blocks_M, total_blocks_N)
+            
+            print("\n" + "-"*80)
+            print(f"GEMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("-"*80)
+            print_xcd_grid(gemm_map_cpu, total_blocks_M, total_blocks_N)
+            
+            
+            print("\n" + "-"*80)
+            print(f"COMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("-"*80)
+            print_xcd_grid(comm_map_cpu, total_blocks_M, total_blocks_N)
+            print("="*80 + "\n")
 
         shmem.info("Validation completed")
 

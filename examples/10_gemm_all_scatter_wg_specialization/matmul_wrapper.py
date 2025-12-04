@@ -61,6 +61,9 @@ class matmul(torch.autograd.Function):
         COLLECT_TIMESTAMPS: bool = False,
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
+        SHOW_MAP: bool = False,
+        gemm_map: torch.Tensor = None,
+        comm_map: torch.Tensor = None,
     ):
         # checks constraints
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -123,13 +126,16 @@ class matmul(torch.autograd.Function):
             COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
             mm_begin_timestamp_ptr=mm_begin_timestamp,
             mm_end_timestamp_ptr=mm_end_timestamp,
+            SHOW_MAP=SHOW_MAP,
+            gemm_map=gemm_map,
+            comm_map=comm_map
         )
 
         if matmul._debug and not is_triton_interpret_set():
             matmul._registers = kk.n_regs
             matmul._spills = kk.n_spills
 
-        return c
+        return c, gemm_map, comm_map
 
     @staticmethod
     def forward(
@@ -154,6 +160,9 @@ class matmul(torch.autograd.Function):
         COLLECT_TIMESTAMPS: bool = False,
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
+        SHOW_MAP: bool = False,
+        gemm_map: torch.Tensor = None,
+        comm_map: torch.Tensor = None,
     ):
         matmul._call(
             a=a,
@@ -176,5 +185,8 @@ class matmul(torch.autograd.Function):
             COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
             mm_begin_timestamp=mm_begin_timestamp,
             mm_end_timestamp=mm_end_timestamp,
+            SHOW_MAP=SHOW_MAP,
+            gemm_map=gemm_map,
+            comm_map=comm_map
         )
-        return c
+        return c, gemm_map, comm_map
