@@ -167,3 +167,19 @@ def read_realtime():
         pack=1,
     )
     return tmp
+
+
+@triton.jit
+def read_xcd_id():
+    xcd_id = tl.inline_asm_elementwise(
+        asm="s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)",
+        constraints=("=s"),
+        args=[],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    return xcd_id
+
+
+

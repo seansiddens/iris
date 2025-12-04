@@ -62,8 +62,10 @@ class matmul(torch.autograd.Function):
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
         SHOW_MAP: bool = False,
-        gemm_map: torch.Tensor = None,
-        comm_map: torch.Tensor = None,
+        gemm_map_wgid: torch.Tensor = None,
+        gemm_map_xcd: torch.Tensor = None,
+        comm_map_wgid: torch.Tensor = None,
+        comm_map_xcd: torch.Tensor = None,
     ):
         # checks constraints
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -127,15 +129,17 @@ class matmul(torch.autograd.Function):
             mm_begin_timestamp_ptr=mm_begin_timestamp,
             mm_end_timestamp_ptr=mm_end_timestamp,
             SHOW_MAP=SHOW_MAP,
-            gemm_map=gemm_map,
-            comm_map=comm_map
+            gemm_map_wgid=gemm_map_wgid,
+            gemm_map_xcd=gemm_map_xcd,
+            comm_map_wgid=comm_map_wgid,
+            comm_map_xcd=comm_map_xcd
         )
 
         if matmul._debug and not is_triton_interpret_set():
             matmul._registers = kk.n_regs
             matmul._spills = kk.n_spills
 
-        return c, gemm_map, comm_map
+        return c, gemm_map_wgid, gemm_map_xcd, comm_map_wgid, comm_map_xcd
 
     @staticmethod
     def forward(
@@ -161,8 +165,10 @@ class matmul(torch.autograd.Function):
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
         SHOW_MAP: bool = False,
-        gemm_map: torch.Tensor = None,
-        comm_map: torch.Tensor = None,
+        gemm_map_wgid: torch.Tensor = None,
+        gemm_map_xcd: torch.Tensor = None,
+        comm_map_wgid: torch.Tensor = None,
+        comm_map_xcd: torch.Tensor = None,
     ):
         matmul._call(
             a=a,
@@ -186,7 +192,9 @@ class matmul(torch.autograd.Function):
             mm_begin_timestamp=mm_begin_timestamp,
             mm_end_timestamp=mm_end_timestamp,
             SHOW_MAP=SHOW_MAP,
-            gemm_map=gemm_map,
-            comm_map=comm_map
+            gemm_map_wgid=gemm_map_wgid,
+            gemm_map_xcd=gemm_map_xcd,
+            comm_map_wgid=comm_map_wgid,
+            comm_map_xcd=comm_map_xcd
         )
-        return c, gemm_map, comm_map
+        return c, gemm_map_wgid, gemm_map_xcd, comm_map_wgid, comm_map_xcd

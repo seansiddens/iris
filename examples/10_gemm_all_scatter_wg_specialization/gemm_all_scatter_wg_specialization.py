@@ -3,7 +3,7 @@
 
 import triton
 import triton.language as tl
-from examples.common.utils import read_realtime
+from examples.common.utils import read_realtime, read_xcd_id
 
 import sys
 import os
@@ -47,11 +47,14 @@ def persistent_gemm_all_scatter_wg_specialization(
     mm_begin_timestamp_ptr: tl.tensor = None,
     mm_end_timestamp_ptr: tl.tensor = None,
     SHOW_MAP: tl.constexpr = False,
-    gemm_map: tl.tensor = None,
-    comm_map: tl.tensor = None,
+    gemm_map_wgid: tl.tensor = None,
+    gemm_map_xcd: tl.tensor = None,
+    comm_map_wgid: tl.tensor = None,
+    comm_map_xcd: tl.tensor = None,
 ):
     pid = tl.program_id(0)
     original_pid = pid # Cache the original wid which dictates XCD affinity
+    xcd_id = read_xcd_id()
 
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
@@ -89,7 +92,8 @@ def persistent_gemm_all_scatter_wg_specialization(
 
             if SHOW_MAP:
                 # Show which hardware WG maps to what logical tile ID for GEMM computation.
-                tl.store(gemm_map + (pid_m * num_pid_n + pid_n), original_pid)
+                tl.store(gemm_map_wgid + (pid_m * num_pid_n + pid_n), original_pid)
+                tl.store(gemm_map_xcd + (pid_m * num_pid_n + pid_n), xcd_id)
 
             rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
             rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -161,7 +165,7 @@ def persistent_gemm_all_scatter_wg_specialization(
         COMM_SMS = NUM_SMS - GEMM_SMS # 32
         pid = pid - GEMM_SMS  # Remap from [224, 255] to [0, 31]
         for tile_id in range(pid, total_tiles, COMM_SMS):
-            # Each COMM WG is responsible for waiting on total_tiles // COMM_SMs tiles. 
+            # Each COMM WG is responsible for waiting on total_tiles // COMM_SMS tiles. 
             # 896 // 32 = 28
 
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -172,7 +176,8 @@ def persistent_gemm_all_scatter_wg_specialization(
             pid_n = (tile_id % num_pid_in_group) // group_size_m
 
             if SHOW_MAP:
-                tl.store(comm_map + (pid_m * num_pid_n + pid_n), original_pid)
+                tl.store(comm_map_wgid + (pid_m * num_pid_n + pid_n), original_pid)
+                tl.store(comm_map_xcd + (pid_m * num_pid_n + pid_n), xcd_id)
 
             # Begin: See the if segment for explanation:
             rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M

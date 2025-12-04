@@ -40,17 +40,7 @@ def print_grid(values, height, width):
     print(grid_str)
 
 
-def print_xcd_grid(values, height, width):
-    """Pretty-print a 2D grid showing XCD assignments (value % 8)."""
-    # XCD values are 0-7, so cell width is always 1
-    cell_width = 1
-    
-    rows = []
-    for r in range(height):
-        row_vals = values[r * width : (r + 1) * width]
-        rows.append(" ".join(f"{v % 8:{cell_width}d}" for v in row_vals))
-    grid_str = "\n".join(rows)
-    print(grid_str)
+
 
 
 def parse_args():
@@ -167,11 +157,15 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     print(f"Total tiles: {total_tiles}, total_blocks_M: {total_blocks_M}, total_blocks_N: {total_blocks_N}")
 
     if SHOW_MAP:
-        gemm_map = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
-        comm_map = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        gemm_map_wgid = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        gemm_map_xcd = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        comm_map_wgid = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        comm_map_xcd = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
     else: 
-        gemm_map = None
-        comm_map = None
+        gemm_map_wgid = None
+        gemm_map_xcd = None
+        comm_map_wgid = None
+        comm_map_xcd = None
 
     locks = shmem.zeros((total_tiles,), device="cuda", dtype=torch.int8)
 
@@ -197,8 +191,10 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     def run_experiment():
         nonlocal local_C
         nonlocal global_C
-        nonlocal gemm_map
-        nonlocal comm_map
+        nonlocal gemm_map_wgid
+        nonlocal gemm_map_xcd
+        nonlocal comm_map_wgid
+        nonlocal comm_map_xcd
         nonlocal kernel_timing
 
         shmem.barrier()
@@ -211,7 +207,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         torch.cuda.nvtx.range_push("GEMM")
         with torch.cuda.stream(gemm_stream):
             kernel_timing["gemm"]["start_event"].record()
-            local_C, gemm_map, comm_map = matmul.apply(
+            local_C, gemm_map_wgid, gemm_map_xcd, comm_map_wgid, comm_map_xcd = matmul.apply(
                 local_A,
                 local_B,
                 local_C,
@@ -233,8 +229,10 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
                 timestamps.mm_begin_timestamp,
                 timestamps.mm_end_timestamp,
                 SHOW_MAP,
-                gemm_map,
-                comm_map
+                gemm_map_wgid,
+                gemm_map_xcd,
+                comm_map_wgid,
+                comm_map_xcd
             )
             kernel_timing["gemm"]["end_event"].record()
             kernel_timing["gemm"]["experiments"] += 1
@@ -283,33 +281,34 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
         # Print GEMM and COMM maps if enabled
         if SHOW_MAP and rank == 0:
-            gemm_map_cpu = gemm_map.cpu().tolist()
-            comm_map_cpu = comm_map.cpu().tolist()
+            gemm_map_wgid_cpu = gemm_map_wgid.cpu().tolist()
+            gemm_map_xcd_cpu = gemm_map_xcd.cpu().tolist()
+            comm_map_wgid_cpu = comm_map_wgid.cpu().tolist()
+            comm_map_xcd_cpu = comm_map_xcd.cpu().tolist()
             
             print("\n" + "="*80)
             print(f"GEMM Map - Workgroup Assignments")
             print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
             print("="*80)
-            print_grid(gemm_map_cpu, total_blocks_M, total_blocks_N)
+            print_grid(gemm_map_wgid_cpu, total_blocks_M, total_blocks_N)
+
+            print("\n" + "-"*80)
+            print(f"GEMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("-"*80)
+            print_grid(gemm_map_xcd_cpu, total_blocks_M, total_blocks_N)
 
             print("\n" + "="*80)
             print(f"COMM Map - Workgroup Assignments")
             print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
             print("="*80)
-            print_grid(comm_map_cpu, total_blocks_M, total_blocks_N)
-            
-            print("\n" + "-"*80)
-            print(f"GEMM Map - XCD Assignments")
-            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
-            print("-"*80)
-            print_xcd_grid(gemm_map_cpu, total_blocks_M, total_blocks_N)
-            
+            print_grid(comm_map_wgid_cpu, total_blocks_M, total_blocks_N)
             
             print("\n" + "-"*80)
             print(f"COMM Map - XCD Assignments")
             print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
             print("-"*80)
-            print_xcd_grid(comm_map_cpu, total_blocks_M, total_blocks_N)
+            print_grid(comm_map_xcd_cpu, total_blocks_M, total_blocks_N)
             print("="*80 + "\n")
 
         shmem.info("Validation completed")
