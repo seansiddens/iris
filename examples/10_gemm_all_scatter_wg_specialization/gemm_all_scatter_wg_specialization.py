@@ -12,7 +12,7 @@ import iris
 
 
 @triton.jit()
-def persistent_gemm_all_scatter_wg_specialization(
+def persistent_gemm_all_scatter_wg_specialization_spatial(
     A,
     B,
     C,
@@ -55,12 +55,15 @@ def persistent_gemm_all_scatter_wg_specialization(
     pid = tl.program_id(0)
     original_pid = pid # Cache the original wid which dictates XCD affinity
     xcd_id = read_xcd_id()
+    GEMM_SMS_PER_XCD = GEMM_SMS // NUM_XCDS
 
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     total_tiles = num_pid_m * num_pid_n
+
+    pos_in_xcd = pid % 32 # NUM_SMS / NUM_XCDS
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -75,7 +78,10 @@ def persistent_gemm_all_scatter_wg_specialization(
     # Split the kernel into two paths, one that performs the GEMM
     # and another that performs the communication. Uses persistent-
     # kernel.
-    if pid < GEMM_SMS:
+
+    # if pid < GEMM_SMS:
+    if pos_in_xcd < GEMM_SMS_PER_XCD: # This hangs!
+        pid = GEMM_SMS_PER_XCD * xcd_id + pos_in_xcd
         for tile_id in range(pid, total_tiles, GEMM_SMS):
             # Don't care about reuse scross this loop iter because these are different timesteps? 
             if COLLECT_TIMESTAMPS:
@@ -157,17 +163,212 @@ def persistent_gemm_all_scatter_wg_specialization(
 
             # TODO: We can remove the cache modifiers here once we ensure that GEMM and COMM CUs are on the same XCD.
             tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
+            # tl.store(c_global + global_offset, c, mask=sub_mask)
             tl.debug_barrier()
             tl.store(locks + tile_id, 1, cache_modifier=".wt")
 
     else:  
         # original_pid >= GEMM_SMS
         COMM_SMS = NUM_SMS - GEMM_SMS # 32
-        pid = pid - GEMM_SMS  # Remap from [224, 255] to [0, 31]
-        for tile_id in range(pid, total_tiles, COMM_SMS):
-            # Each COMM WG is responsible for waiting on total_tiles // COMM_SMS tiles. 
-            # 896 // 32 = 28
+        COMM_SMS_PER_XCD = COMM_SMS // NUM_XCDS # 4
+        GEMM_SMS_PER_COMM_SM = GEMM_SMS_PER_XCD // COMM_SMS_PER_XCD
+        # pid = pid - GEMM_SMS  # Remap from [224, 255] to [0, 31]
+        # TODO: Need to have a sub loop that let seach COMM SM process the tiles it depends on in order.
+        # Remap to [0, COMM_SMS)
+        comm_pid = COMM_SMS_PER_XCD * xcd_id + (pos_in_xcd - GEMM_SMS_PER_XCD)
+        # for tile_id in range(comm_pid, total_tiles, COMM_SMS):
+        chunk = GEMM_SMS_PER_COMM_SM
+        chunk_stride = COMM_SMS * chunk
+        start = comm_pid * chunk
+        
+        for base in range(start, total_tiles, chunk_stride):
+            end = min(base + chunk, total_tiles)
+            for tile_id in range(base, end):
+                num_pid_in_group = GROUP_SIZE_M * num_pid_n
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+                pid_n = (tile_id % num_pid_in_group) // group_size_m
 
+                if SHOW_MAP:
+                    tl.store(comm_map_wgid + (pid_m * num_pid_n + pid_n), original_pid)
+                    tl.store(comm_map_xcd + (pid_m * num_pid_n + pid_n), xcd_id)
+                    # tl.store(comm_map_xcd + (pid_m * num_pid_n + pid_n), GEMM_SMS_PER_COMM_SM)
+
+                # Begin: See the if segment for explanation:
+                rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+                rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+                rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+                rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+                sub_mask = (rm[:, None] < M) & (rn[None, :] < N)
+                global_offset = rm[:, None] * stride_cm_global + (rn[None, :] + cur_rank * N) * stride_cn_global
+                # End: masks/offset calculations.
+
+                while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
+                    pass
+
+                for remote_rank in range(world_size):
+                    if remote_rank != cur_rank:
+                        iris.put(
+                            c_global + global_offset,
+                            c_global + global_offset,
+                            cur_rank,
+                            remote_rank,
+                            heap_bases,
+                            mask=sub_mask,
+                        )
+
+
+@triton.jit()
+def persistent_gemm_all_scatter_wg_specialization(
+    A,
+    B,
+    C,
+    c_global,
+    bias_ptr,
+    locks,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_cm_global,
+    stride_cn_global,
+    stride_bias,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    GEMM_SMS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    BIAS: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    heap_bases: tl.tensor,
+    cur_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    COLLECT_TIMESTAMPS: tl.constexpr = False,
+    mm_begin_timestamp_ptr: tl.tensor = None,
+    mm_end_timestamp_ptr: tl.tensor = None,
+    SHOW_MAP: tl.constexpr = False,
+    gemm_map_wgid: tl.tensor = None,
+    gemm_map_xcd: tl.tensor = None,
+    comm_map_wgid: tl.tensor = None,
+    comm_map_xcd: tl.tensor = None,
+):
+    pid = tl.program_id(0)
+    original_pid = pid
+    xcd_id = read_xcd_id()
+
+    if NUM_XCDS != 1:
+        pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    total_tiles = num_pid_m * num_pid_n
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    acc_dtype = tl.float32 if C.type.element_ty != tl.int8 else tl.int32
+
+    # Workgroup specialization:
+    # Split the kernel into two paths, one that performs the GEMM
+    # and another that performs the communication. Uses persistent-
+    # kernel.
+    if pid < GEMM_SMS:
+        for tile_id in range(pid, total_tiles, GEMM_SMS):
+            if COLLECT_TIMESTAMPS:
+                timestamp = read_realtime()
+                tl.atomic_min(mm_begin_timestamp_ptr + tile_id, timestamp)
+
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = tile_id // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+            pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+            if SHOW_MAP:
+                tl.store(gemm_map_wgid + (pid_m * num_pid_n + pid_n), original_pid)
+                tl.store(gemm_map_xcd + (pid_m * num_pid_n + pid_n), xcd_id)
+
+            rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+            rk = tl.arange(0, BLOCK_SIZE_K)
+            rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+            rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+            A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+            B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+
+            tl.assume(pid_m >= 0)
+            tl.assume(pid_n >= 0)
+
+            loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+            if not EVEN_K:
+                loop_k -= 1
+
+            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+            for k in range(0, loop_k):
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)))
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)))
+                acc += tl.dot(a, b)
+                A_BASE += BLOCK_SIZE_K * stride_ak
+                B_BASE += BLOCK_SIZE_K * stride_bk
+
+            if not EVEN_K:
+                k = loop_k
+                rk = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+                A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+                B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+                A_BASE = tl.multiple_of(A_BASE, (1, 16))
+                B_BASE = tl.multiple_of(B_BASE, (16, 1))
+                a = tl.load(A_BASE, mask=rk[None, :] < K, other=0.0)
+                b = tl.load(B_BASE, mask=rk[:, None] < K, other=0.0)
+                acc += tl.dot(a, b)
+
+            # Accumulator registers with C results
+            c = acc.to(C.type.element_ty)
+
+            rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+            # Add compiler hints
+            rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+            rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+            # Define the C-mask (BLOCK_SIZE_M, 1) x (1, BLOCK_SIZE_N)
+            sub_mask = (rm[:, None] < M) & (rn[None, :] < N)
+
+            # Calculate the "global" offset of C based on the rank.
+            # Note how the N-dimension is being multiplied by current rank.
+            # This is because each rank is computing a portion of the N-dimension
+            # locally and then scattering it to all other ranks to complete
+            # the global N-dimension.
+            global_offset = rm[:, None] * stride_cm_global + (rn[None, :] + cur_rank * N) * stride_cn_global
+
+            # Timestamp for GEMM before store
+            if COLLECT_TIMESTAMPS:
+                timestamp = read_realtime()
+                tl.atomic_max(mm_end_timestamp_ptr + tile_id, timestamp)
+
+            tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
+            tl.debug_barrier()
+            tl.store(locks + tile_id, 1, cache_modifier=".wt")
+
+    else:  # pid >= GEMM_SMS
+        COMM_SMS = NUM_SMS - GEMM_SMS
+        pid = pid - GEMM_SMS
+        for tile_id in range(pid, total_tiles, COMM_SMS):
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
