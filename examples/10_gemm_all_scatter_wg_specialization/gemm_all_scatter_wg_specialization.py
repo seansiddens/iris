@@ -162,10 +162,11 @@ def persistent_gemm_all_scatter_wg_specialization_spatial(
                 tl.atomic_max(mm_end_timestamp_ptr + tile_id, timestamp)
 
             # TODO: We can remove the cache modifiers here once we ensure that GEMM and COMM CUs are on the same XCD.
-            tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
-            # tl.store(c_global + global_offset, c, mask=sub_mask)
+            # tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
+            tl.store(c_global + global_offset, c, mask=sub_mask)
             tl.debug_barrier()
-            tl.store(locks + tile_id, 1, cache_modifier=".wt")
+            # tl.store(locks + tile_id, 1, cache_modifier=".wt")
+            tl.store(locks + tile_id, 1)
 
     else:  
         # original_pid >= GEMM_SMS
@@ -205,6 +206,8 @@ def persistent_gemm_all_scatter_wg_specialization_spatial(
                 global_offset = rm[:, None] * stride_cm_global + (rn[None, :] + cur_rank * N) * stride_cn_global
                 # End: masks/offset calculations.
 
+                # while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
+                #     pass
                 while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
                     pass
 

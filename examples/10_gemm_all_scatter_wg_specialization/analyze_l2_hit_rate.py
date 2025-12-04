@@ -9,43 +9,48 @@ L2 hit rate for the persistent_gemm_all_scatter_wg_specialization kernel.
 import csv
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
-def parse_csv(csv_path: Path, kernel_name: str) -> List[Tuple[float, float]]:
+def parse_csv(csv_path: Path, kernel_names: List[str]) -> Dict[str, List[Tuple[float, float]]]:
     """
     Parse CSV file and extract TCC_HIT_sum and TCC_MISS_sum pairs for the specified kernel.
     
     Args:
         csv_path: Path to the CSV file
-        kernel_name: Name of the kernel to analyze
+        kernel_names: Names of the kernels to analyze
         
     Returns:
-        List of (hit_count, miss_count) tuples, one per kernel invocation
+        Dict mapping kernel name to list of (hit_count, miss_count) tuples
     """
-    hit_miss_pairs = []
+    kernel_set = set(kernel_names)
+    hit_miss_pairs: Dict[str, List[Tuple[float, float]]] = {k: [] for k in kernel_names}
     
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
         
         # Group rows by Correlation_Id to pair hits and misses
-        correlation_data = {}
+        correlation_data: Dict[Tuple[str, str], Dict[str, float]] = {}
         
         for row in reader:
-            if row['Kernel_Name'] == kernel_name:
-                corr_id = row['Correlation_Id']
-                counter_name = row['Counter_Name']
-                counter_value = float(row['Counter_Value'])
+            kernel = row['Kernel_Name']
+            if kernel not in kernel_set:
+                continue
+
+            corr_id = row['Correlation_Id']
+            counter_name = row['Counter_Name']
+            counter_value = float(row['Counter_Value'])
+            key = (kernel, corr_id)
+            
+            if key not in correlation_data:
+                correlation_data[key] = {}
                 
-                if corr_id not in correlation_data:
-                    correlation_data[corr_id] = {}
-                
-                correlation_data[corr_id][counter_name] = counter_value
+            correlation_data[key][counter_name] = counter_value
         
         # Extract hit/miss pairs
-        for corr_id, counters in sorted(correlation_data.items()):
+        for (kernel, corr_id), counters in sorted(correlation_data.items()):
             if 'TCC_HIT_sum' in counters and 'TCC_MISS_sum' in counters:
-                hit_miss_pairs.append((counters['TCC_HIT_sum'], counters['TCC_MISS_sum']))
+                hit_miss_pairs[kernel].append((counters['TCC_HIT_sum'], counters['TCC_MISS_sum']))
     
     return hit_miss_pairs
 
@@ -78,32 +83,44 @@ def main():
         print(f"Error: CSV file not found: {csv_path}", file=sys.stderr)
         sys.exit(1)
     
-    kernel_name = "persistent_gemm_all_scatter_wg_specialization"
+    kernel_names = [
+        "persistent_gemm_all_scatter_wg_specialization",
+        "persistent_gemm_all_scatter_wg_specialization_spatial",
+    ]
     
-    print(f"Analyzing L2 hit rates for kernel: {kernel_name}")
+    print(f"Analyzing L2 hit rates for kernels: {', '.join(kernel_names)}")
     print(f"Reading from: {csv_path}\n")
     
     # Parse the CSV
-    hit_miss_pairs = parse_csv(csv_path, kernel_name)
+    kernel_hit_miss = parse_csv(csv_path, kernel_names)
+    any_data = False
     
-    if not hit_miss_pairs:
-        print(f"No data found for kernel: {kernel_name}", file=sys.stderr)
+    for kernel_name in kernel_names:
+        hit_miss_pairs = kernel_hit_miss.get(kernel_name, [])
+        
+        if not hit_miss_pairs:
+            print(f"No data found for kernel: {kernel_name}\n", file=sys.stderr)
+            continue
+        
+        any_data = True
+        print(f"Kernel: {kernel_name}")
+        print(f"Found {len(hit_miss_pairs)} kernel invocations\n")
+        
+        # Calculate hit rates for each invocation
+        hit_rates = []
+        for i, (hits, misses) in enumerate(hit_miss_pairs):
+            hit_rate = calculate_hit_rate(hits, misses)
+            hit_rates.append(hit_rate)
+            print(f"Invocation {i+1:3d}: Hits={hits:12.0f}, Misses={misses:12.0f}, Hit Rate={hit_rate:6.2f}%")
+        
+        # Calculate and print average
+        avg_hit_rate = sum(hit_rates) / len(hit_rates)
+        print(f"\n{'='*70}")
+        print(f"Average L2 Hit Rate: {avg_hit_rate:.2f}%")
+        print(f"{'='*70}\n")
+    
+    if not any_data:
         sys.exit(1)
-    
-    print(f"Found {len(hit_miss_pairs)} kernel invocations\n")
-    
-    # Calculate hit rates for each invocation
-    hit_rates = []
-    for i, (hits, misses) in enumerate(hit_miss_pairs):
-        hit_rate = calculate_hit_rate(hits, misses)
-        hit_rates.append(hit_rate)
-        print(f"Invocation {i+1:3d}: Hits={hits:12.0f}, Misses={misses:12.0f}, Hit Rate={hit_rate:6.2f}%")
-    
-    # Calculate and print average
-    avg_hit_rate = sum(hit_rates) / len(hit_rates)
-    print(f"\n{'='*70}")
-    print(f"Average L2 Hit Rate: {avg_hit_rate:.2f}%")
-    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

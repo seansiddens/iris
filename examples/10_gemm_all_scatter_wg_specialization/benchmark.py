@@ -23,8 +23,6 @@ from matmul_wrapper import matmul
 torch.manual_seed(123)
 random.seed(123)
 
-SHOW_MAP = True
-
 
 def print_grid(values, height, width):
     """Pretty-print a 2D grid of values laid out row-major."""
@@ -49,10 +47,12 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # parser.add_argument("-m", type=int, default=8192*2, help="Number of rows in matrix A")
-    parser.add_argument("-m", type=int, default=3584, help="Number of rows in matrix A")
-    parser.add_argument("-n", type=int, default=2048, help="Number of columns in matrix B")
+    # parser.add_argument("-m", type=int, default=3584, help="Number of rows in matrix A")
+    parser.add_argument("-m", type=int, default=7168, help="Number of rows in matrix A")
+    # parser.add_argument("-n", type=int, default=2048, help="Number of columns in matrix B")
+    parser.add_argument("-n", type=int, default=4096, help="Number of columns in matrix B")
     # parser.add_argument("-n", type=int, default=4608*4, help="Number of columns in matrix B")
-    parser.add_argument("-k", type=int, default=36864, help="Common dimension between matrices A and B")
+    parser.add_argument("-k", type=int, default=36864*8, help="Common dimension between matrices A and B")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
     parser.add_argument("-t", "--trace_tiles", action="store_true", help="Enable tile-tracing mode")
@@ -95,6 +95,11 @@ def parse_args():
         default="spatial",
         choices=["baseline", "spatial"],
         help="Choose between baseline and spatial workgroup specialization",
+    )
+    parser.add_argument(
+        "--show_map",
+        action="store_true",
+        help="Print GEMM/COMM workgroup-to-tile maps (rank 0 only)",
     )
 
     return vars(parser.parse_args())
@@ -164,7 +169,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     total_tiles = total_blocks_M * total_blocks_N
     print(f"Total tiles: {total_tiles}, total_blocks_M: {total_blocks_M}, total_blocks_N: {total_blocks_N}")
 
-    if SHOW_MAP:
+    if args["show_map"]:
         gemm_map_wgid = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
         gemm_map_xcd = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
         comm_map_wgid = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
@@ -236,7 +241,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
                 args["trace_tiles"],             # COLLECT_TIMESTAMPS
                 timestamps.mm_begin_timestamp,   # mm_begin_timestamp
                 timestamps.mm_end_timestamp,     # mm_end_timestamp
-                SHOW_MAP,                        # SHOW_MAP
+                args["show_map"],                # SHOW_MAP
                 gemm_map_wgid,                   # gemm_map_wgid
                 gemm_map_xcd,                    # gemm_map_xcd
                 comm_map_wgid,                   # comm_map_wgid
@@ -289,7 +294,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
             json_writer.add_field("gemm_spills", gemm_spills)
 
         # Print GEMM and COMM maps if enabled
-        if SHOW_MAP and rank == 0:
+        if args["show_map"] and rank == 0:
             gemm_map_wgid_cpu = gemm_map_wgid.cpu().tolist()
             gemm_map_xcd_cpu = gemm_map_xcd.cpu().tolist()
             comm_map_wgid_cpu = comm_map_wgid.cpu().tolist()
@@ -301,17 +306,17 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
             print("="*80)
             print_grid(gemm_map_wgid_cpu, total_blocks_M, total_blocks_N)
 
-            print("\n" + "-"*80)
-            print(f"GEMM Map - XCD Assignments")
-            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
-            print("-"*80)
-            print_grid(gemm_map_xcd_cpu, total_blocks_M, total_blocks_N)
-
             print("\n" + "="*80)
             print(f"COMM Map - Workgroup Assignments")
             print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
             print("="*80)
             print_grid(comm_map_wgid_cpu, total_blocks_M, total_blocks_N)
+
+            print("\n" + "-"*80)
+            print(f"GEMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("-"*80)
+            print_grid(gemm_map_xcd_cpu, total_blocks_M, total_blocks_N)
             
             print("\n" + "-"*80)
             print(f"COMM Map - XCD Assignments")
