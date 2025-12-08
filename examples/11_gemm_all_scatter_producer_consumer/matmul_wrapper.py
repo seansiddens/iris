@@ -5,10 +5,11 @@ import torch
 import triton
 
 # from streamk_kernel import streamk_gemm
-from gemm_all_scatter_producer_consumer import persistent_gemm
+from gemm_all_scatter_producer_consumer import persistent_gemm, persistent_gemm_spatial
 from examples.common.utils import is_triton_interpret_set
 import iris
 
+# Default to baseline kernel, can be changed via set_kernel_variant()
 gemm_kernel = persistent_gemm
 
 
@@ -22,6 +23,17 @@ class matmul(torch.autograd.Function):
     @staticmethod
     def set_debug(debug: bool):
         matmul._debug = debug
+
+    @staticmethod
+    def set_kernel_variant(variant: str):
+        """Set which kernel variant to use: 'baseline' or 'spatial'"""
+        global gemm_kernel
+        if variant == "baseline":
+            gemm_kernel = persistent_gemm
+        elif variant == "spatial":
+            gemm_kernel = persistent_gemm_spatial
+        else:
+            raise ValueError(f"Unknown variant '{variant}'. Must be 'baseline' or 'spatial'.")
 
     @staticmethod
     def get_matmul_registers():
@@ -58,6 +70,10 @@ class matmul(torch.autograd.Function):
         COLLECT_TIMESTAMPS: bool = False,
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
+        SHOW_MAP: bool = False,
+        gemm_map_xcd: torch.Tensor = None,
+        gemm_xcd_flag: torch.Tensor = None,
+        kernel_variant: str = "baseline",
     ):
         # checks constraints
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -81,48 +97,93 @@ class matmul(torch.autograd.Function):
 
         # compute grid (work to do per SM on the first wave)
         stride_bias = bias.stride(0) if use_bias else 0
-        kk = gemm_kernel[(gemm_sms,)](
-            a,
-            b,
-            c,
-            bias,
-            locks,
-            M,
-            N,
-            K,
-            a.stride(0),
-            a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            c.stride(0),
-            c.stride(1),
-            stride_bias,
-            BLOCK_SIZE_M=BLK_M,
-            BLOCK_SIZE_N=BLK_N,
-            BLOCK_SIZE_K=BLK_K,
-            GROUP_SIZE_M=gsize_m,
-            GEMM_SMS=gemm_sms,
-            NUM_XCDS=num_xcds,
-            BIAS=use_bias,
-            EVEN_K=even_k,
-            num_stages=num_stages,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            matrix_instr_nonkdim=mfma,
-            kpack=kpack,
-            heap_bases=heap_bases_ptr,
-            cur_rank=rank,
-            world_size=world_size,
-            COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
-            mm_begin_timestamp_ptr=mm_begin_timestamp,
-            mm_end_timestamp_ptr=mm_end_timestamp,
-        )
+        
+        # Choose kernel based on variant
+        if kernel_variant == "spatial":
+            kk = persistent_gemm_spatial[(gemm_sms,)](
+                a,
+                b,
+                c,
+                bias,
+                locks,
+                M,
+                N,
+                K,
+                a.stride(0),
+                a.stride(1),
+                b.stride(0),
+                b.stride(1),
+                c.stride(0),
+                c.stride(1),
+                stride_bias,
+                BLOCK_SIZE_M=BLK_M,
+                BLOCK_SIZE_N=BLK_N,
+                BLOCK_SIZE_K=BLK_K,
+                GROUP_SIZE_M=gsize_m,
+                GEMM_SMS=gemm_sms,
+                NUM_XCDS=num_xcds,
+                BIAS=use_bias,
+                EVEN_K=even_k,
+                num_stages=num_stages,
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                matrix_instr_nonkdim=mfma,
+                kpack=kpack,
+                heap_bases=heap_bases_ptr,
+                cur_rank=rank,
+                world_size=world_size,
+                COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
+                mm_begin_timestamp_ptr=mm_begin_timestamp,
+                mm_end_timestamp_ptr=mm_end_timestamp,
+                SHOW_MAP=SHOW_MAP,
+                gemm_map_xcd=gemm_map_xcd,
+                gemm_xcd_flag=gemm_xcd_flag,
+            )
+        else:  # baseline
+            kk = persistent_gemm[(gemm_sms,)](
+                a,
+                b,
+                c,
+                bias,
+                locks,
+                M,
+                N,
+                K,
+                a.stride(0),
+                a.stride(1),
+                b.stride(0),
+                b.stride(1),
+                c.stride(0),
+                c.stride(1),
+                stride_bias,
+                BLOCK_SIZE_M=BLK_M,
+                BLOCK_SIZE_N=BLK_N,
+                BLOCK_SIZE_K=BLK_K,
+                GROUP_SIZE_M=gsize_m,
+                GEMM_SMS=gemm_sms,
+                NUM_XCDS=num_xcds,
+                BIAS=use_bias,
+                EVEN_K=even_k,
+                num_stages=num_stages,
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                matrix_instr_nonkdim=mfma,
+                kpack=kpack,
+                heap_bases=heap_bases_ptr,
+                cur_rank=rank,
+                world_size=world_size,
+                COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
+                mm_begin_timestamp_ptr=mm_begin_timestamp,
+                mm_end_timestamp_ptr=mm_end_timestamp,
+                SHOW_MAP=SHOW_MAP,
+                gemm_map_xcd=gemm_map_xcd,
+            )
 
         if matmul._debug and not is_triton_interpret_set():
             matmul._registers = kk.n_regs
             matmul._spills = kk.n_spills
 
-        return c
+        return c, gemm_map_xcd
 
     @staticmethod
     def forward(
@@ -145,6 +206,10 @@ class matmul(torch.autograd.Function):
         COLLECT_TIMESTAMPS: bool = False,
         mm_begin_timestamp: torch.Tensor = None,
         mm_end_timestamp: torch.Tensor = None,
+        SHOW_MAP: bool = False,
+        gemm_map_xcd: torch.Tensor = None,
+        gemm_xcd_flag: torch.Tensor = None,
+        kernel_variant: str = "baseline",
     ):
         matmul._call(
             a=a,
@@ -165,5 +230,9 @@ class matmul(torch.autograd.Function):
             COLLECT_TIMESTAMPS=COLLECT_TIMESTAMPS,
             mm_begin_timestamp=mm_begin_timestamp,
             mm_end_timestamp=mm_end_timestamp,
+            SHOW_MAP=SHOW_MAP,
+            gemm_map_xcd=gemm_map_xcd,
+            gemm_xcd_flag=gemm_xcd_flag,
+            kernel_variant=kernel_variant,
         )
-        return c
+        return c, gemm_map_xcd

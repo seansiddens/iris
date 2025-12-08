@@ -19,10 +19,24 @@ from examples.common.validation import validate_gemm
 import iris
 
 from matmul_wrapper import matmul
-from gemm_all_scatter_producer_consumer import persistent_all_scatter
+from gemm_all_scatter_producer_consumer import persistent_all_scatter, persistent_all_scatter_spatial
 
 torch.manual_seed(123)
 random.seed(123)
+
+
+def print_grid(values, height, width):
+    """Pretty-print a 2D grid of values laid out row-major."""
+    # Calculate the maximum width needed for any value
+    max_val = max(values) if values else 0
+    cell_width = len(str(max_val))
+    
+    rows = []
+    for r in range(height):
+        row_vals = values[r * width : (r + 1) * width]
+        rows.append(" ".join(f"{v:{cell_width}d}" for v in row_vals))
+    grid_str = "\n".join(rows)
+    print(grid_str)
 
 
 def parse_args():
@@ -37,6 +51,7 @@ def parse_args():
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
     parser.add_argument("-t", "--trace_tiles", action="store_true", help="Enable tile-tracing mode")
     parser.add_argument("-b", "--benchmark", action="store_true", help="Enable benchmarking mode")
+    parser.add_argument("--show_map", action="store_true", help="Enable XCD mapping visualization")
     parser.add_argument(
         "--datatype",
         type=str,
@@ -66,6 +81,13 @@ def parse_args():
         "--comm_sms", type=int, default=None, help="Number of SMs for All-Scatter kernel (default: auto-detected)"
     )
     parser.add_argument("-r", "--num_ranks", type=int, default=2, help="Number of ranks/processes")
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="baseline",
+        choices=["baseline", "spatial"],
+        help="Kernel variant to use: 'baseline' (original) or 'spatial' (XCD-aware)",
+    )
 
     return vars(parser.parse_args())
 
@@ -96,6 +118,8 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         # comm_sms is the leftover: total - next_power_of_2
         args["comm_sms"] = cu_count - next_pow2
 
+    print(f"gemm sms: {args['gemm_sms']}, comm sms: {args['comm_sms']}")
+
     # GEMM
     datatype = torch.float32
     if args["datatype"] == "fp16":
@@ -120,6 +144,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
     json_writer = JSONWriter(args["output_file"])
     json_writer.add_field("world_size", world_size)
+    json_writer.add_field("variant", args["variant"])
 
     # Splitting
     args["n"] = args["n"] // world_size
@@ -134,6 +159,17 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     total_blocks_M = triton.cdiv(args["m"], args["BLK_M"])
     total_blocks_N = triton.cdiv(args["n"], args["BLK_N"])
     total_tiles = total_blocks_M * total_blocks_N
+    print(f"Total tiles: {total_tiles}, total_blocks_M: {total_blocks_M}, total_blocks_N: {total_blocks_N}")
+
+    if args["show_map"]:
+        gemm_map_xcd = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+        comm_map_xcd = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
+    else:
+        gemm_map_xcd = None
+        comm_map_xcd = None
+
+    # Flag for GEMM to signal its XCD ID to the scatter kernel
+    gemm_xcd_flag = shmem.full((1,), -1, device="cuda", dtype=torch.int64)
 
     locks = shmem.zeros((total_tiles,), device="cuda", dtype=torch.int8)
 
@@ -167,9 +203,15 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
     def run_experiment():
         nonlocal C
+        nonlocal gemm_map_xcd
+        nonlocal comm_map_xcd
+        nonlocal gemm_xcd_flag
         nonlocal kernel_timing
 
         shmem.barrier()
+
+        # Reset the flag to -1 before each run
+        gemm_xcd_flag.fill_(-1)
 
         if args["trace_tiles"]:
             timestamps.reset()
@@ -179,7 +221,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         torch.cuda.nvtx.range_push("GEMM")
         with torch.cuda.stream(gemm_stream):
             kernel_timing["gemm"]["start_event"].record()
-            C = matmul.apply(
+            C, gemm_map_xcd = matmul.apply(
                 local_A,
                 local_B,
                 C,
@@ -198,6 +240,10 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
                 args["trace_tiles"],
                 timestamps.mm_begin_timestamp,
                 timestamps.mm_end_timestamp,
+                args["show_map"],
+                gemm_map_xcd,
+                gemm_xcd_flag,
+                args["variant"],
             )
             kernel_timing["gemm"]["end_event"].record()
             kernel_timing["gemm"]["experiments"] += 1
@@ -206,25 +252,52 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         torch.cuda.nvtx.range_push("Communication")
         with torch.cuda.stream(comm_stream):
             kernel_timing["communication"]["start_event"].record()
-            persistent_all_scatter[(args["comm_sms"],)](
-                C,
-                locks,
-                args["M"],
-                args["n"],
-                C.stride(0),
-                C.stride(1),
-                args["BLK_M"],
-                args["BLK_N"],
-                args["gsize_m"],
-                args["comm_sms"],
-                num_xcds,
-                shmem.get_heap_bases(),
-                rank,
-                world_size,
-                args["trace_tiles"],
-                timestamps.mm_begin_timestamp,
-                timestamps.mm_end_timestamp,
-            )
+            if args["variant"] == "spatial":
+                persistent_all_scatter_spatial[(args["comm_sms"],)](
+                    C,
+                    locks,
+                    args["M"],
+                    args["n"],
+                    C.stride(0),
+                    C.stride(1),
+                    args["BLK_M"],
+                    args["BLK_N"],
+                    args["gsize_m"],
+                    args["gemm_sms"],
+                    args["comm_sms"],
+                    num_xcds,
+                    shmem.get_heap_bases(),
+                    rank,
+                    world_size,
+                    args["trace_tiles"],
+                    timestamps.mm_begin_timestamp,
+                    timestamps.mm_end_timestamp,
+                    args["show_map"],
+                    comm_map_xcd,
+                    gemm_xcd_flag,
+                )
+            else:  # baseline
+                persistent_all_scatter[(args["comm_sms"],)](
+                    C,
+                    locks,
+                    args["M"],
+                    args["n"],
+                    C.stride(0),
+                    C.stride(1),
+                    args["BLK_M"],
+                    args["BLK_N"],
+                    args["gsize_m"],
+                    args["comm_sms"],
+                    num_xcds,
+                    shmem.get_heap_bases(),
+                    rank,
+                    world_size,
+                    args["trace_tiles"],
+                    timestamps.mm_begin_timestamp,
+                    timestamps.mm_end_timestamp,
+                    args["show_map"],
+                    comm_map_xcd,
+                )
             kernel_timing["communication"]["end_event"].record()
             kernel_timing["communication"]["experiments"] += 1
         torch.cuda.nvtx.range_pop()
@@ -268,6 +341,24 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
             json_writer.add_field("gemm_registers", gemm_registers)
             json_writer.add_field("gemm_spills", gemm_spills)
+
+        # Print GEMM and COMM maps if enabled
+        if args["show_map"] and rank == 0:
+            gemm_map_xcd_cpu = gemm_map_xcd.cpu().tolist()
+            comm_map_xcd_cpu = comm_map_xcd.cpu().tolist()
+            
+            print("\n" + "="*80)
+            print(f"GEMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("="*80)
+            print_grid(gemm_map_xcd_cpu, total_blocks_M, total_blocks_N)
+
+            print("\n" + "="*80)
+            print(f"COMM Map - XCD Assignments")
+            print(f"Grid: {total_blocks_M} rows x {total_blocks_N} columns")
+            print("="*80)
+            print_grid(comm_map_xcd_cpu, total_blocks_M, total_blocks_N)
+            print("="*80 + "\n")
 
         shmem.info("Validation completed")
 
