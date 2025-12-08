@@ -165,8 +165,8 @@ def persistent_gemm_all_scatter_wg_specialization_spatial(
             # tl.store(c_global + global_offset, c, mask=sub_mask, cache_modifier=".wt")
             tl.store(c_global + global_offset, c, mask=sub_mask)
             tl.debug_barrier()
-            # tl.store(locks + tile_id, 1, cache_modifier=".wt")
-            tl.store(locks + tile_id, 1)
+            tl.store(locks + tile_id, 1, cache_modifier=".cg")
+            # tl.store(locks + tile_id, 1)
 
     else:  
         # original_pid >= GEMM_SMS
@@ -206,10 +206,10 @@ def persistent_gemm_all_scatter_wg_specialization_spatial(
                 global_offset = rm[:, None] * stride_cm_global + (rn[None, :] + cur_rank * N) * stride_cn_global
                 # End: masks/offset calculations.
 
-                # while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
-                #     pass
-                while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
+                while tl.load(locks + tile_id, cache_modifier=".cg") != 1:
                     pass
+                # while tl.load(locks + tile_id) != 1:
+                #     pass
 
                 for remote_rank in range(world_size):
                     if remote_rank != cur_rank:
