@@ -114,6 +114,7 @@ def main():
         for i, (hits, misses) in enumerate(hit_miss_pairs):
             hit_rate = calculate_hit_rate(hits, misses)
             hit_rates.append(hit_rate)
+            print(f"Invocation {i+1:3d}: Hits={hits:12.0f}, Misses={misses:12.0f}, Hit Rate={hit_rate:6.2f}%")
         
         # Calculate and print statistics for this kernel
         avg_hit_rate = statistics.mean(hit_rates)
