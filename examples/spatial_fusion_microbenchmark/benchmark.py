@@ -2,21 +2,28 @@ import torch
 import torch.multiprocessing as mp
 import triton
 import argparse
+import json
+import statistics
+from pathlib import Path
 from spatial_fusion import producer_kernel, consumer_kernel, workgroup_specialized_kernel
 
 def main():
     parser = argparse.ArgumentParser(description='Benchmark producer-consumer kernels')
-    parser.add_argument('--spatial', action='store_true', 
+    parser.add_argument('-s', '--spatial', action='store_true', 
                         help='Enable spatial fusion')
-    parser.add_argument('--wg-specialized', action='store_true',
-                        help='Use workgroup specialized kernel (ignores --spatial flag)')
+    parser.add_argument('-wg', '--wg-specialized', action='store_true',
+                        help='Use workgroup specialized kernel')
+    parser.add_argument('-n', '--num-tiles', type=int, default=8,
+                        help='Number of tiles (default: 8)')
+    parser.add_argument('-o', '--output', type=str, default='benchmark_results.json',
+                        help='Output JSON file for results (default: benchmark_results.json)')
     args = parser.parse_args()
     
     datatype = torch.bfloat16
     block_size = 256
-    num_tiles = 512
+    num_tiles = args.num_tiles
     buffer_size = block_size * num_tiles
-    num_workgroups = 8
+    num_workgroups = 16 if args.wg_specialized else 8
     num_trials = 10
     enable_spatial_fusion = args.spatial
     use_wg_specialized = args.wg_specialized
@@ -36,6 +43,7 @@ def main():
     producer_xcd.fill_(-1)
     consumer_xcd = torch.zeros(1, device="cuda", dtype=torch.int32)
     consumer_xcd.fill_(-1)
+    barrier = torch.zeros(1, device="cuda", dtype=torch.int32)
 
     producer_stream = torch.cuda.Stream()
     consumer_stream = torch.cuda.Stream()
@@ -57,6 +65,7 @@ def main():
         flag.fill_(-1)
         producer_xcd.fill_(-1)
         consumer_xcd.fill_(-1)
+        barrier.fill_(0)
         torch.cuda.synchronize()
 
         # Record reference time
@@ -93,7 +102,8 @@ def main():
                     producer_xcd=producer_xcd,
                     NUM_ELEMENTS=buffer_size,
                     BLOCK_SIZE=block_size,
-                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion
+                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion,
+                    barrier=barrier
                 )
                 producer_end.record()
             torch.cuda.nvtx.range_pop()
@@ -109,7 +119,8 @@ def main():
                     consumer_xcd=consumer_xcd,
                     NUM_ELEMENTS=buffer_size,
                     BLOCK_SIZE=block_size,
-                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion
+                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion,
+                    barrier=barrier
                 )
                 consumer_end.record()
             torch.cuda.nvtx.range_pop()
@@ -161,6 +172,8 @@ def main():
             if prod_end_ms - prod_start_ms > 0:
                 print(f"Overlap %: {overlap_ms/(prod_end_ms-prod_start_ms)*100:.1f}% of producer")
         print(f"{'='*60}\n")
+        
+        return prod_xcd, cons_xcd
 
     # Warmup
     print("Warmup...")
@@ -174,13 +187,14 @@ def main():
 
     # Benchmark trials
     print(f"\nRunning {num_trials} benchmark trials...")
+    final_prod_xcd = -1
+    final_cons_xcd = -1
     for trial in range(num_trials):
         # if (trial + 1) % 10 == 0:
         #     print(f"Completed {trial + 1}/{num_trials} trials")
-        run_experiment()
+        final_prod_xcd, final_cons_xcd = run_experiment()
 
     # Calculate and print average statistics
-    import statistics
     
     avg_producer = statistics.mean(producer_durations)
     avg_consumer = statistics.mean(consumer_durations)
@@ -206,6 +220,55 @@ def main():
         if avg_producer > 0:
             print(f"Overlap %: {avg_overlap/avg_producer*100:.1f}% of producer")
     print(f"{'='*60}\n")
+
+    # Save results to JSON
+    results = {
+        "configuration": {
+            "kernel_mode": "workgroup_specialized" if use_wg_specialized else "concurrent",
+            "spatial_fusion": enable_spatial_fusion,
+            "block_size": block_size,
+            "num_tiles": num_tiles,
+            "buffer_size": buffer_size,
+            "num_workgroups": num_workgroups,
+            "num_trials": num_trials,
+            "datatype": str(datatype)
+        },
+        "xcd_schedule": {
+            "producer_xcd": final_prod_xcd,
+            "consumer_xcd": final_cons_xcd
+        },
+        "timing_results": {
+            "producer_ms": {
+                "mean": avg_producer,
+                "std": std_producer,
+                "samples": producer_durations
+            },
+            "consumer_ms": {
+                "mean": avg_consumer,
+                "std": std_consumer,
+                "samples": consumer_durations
+            },
+            "overlap_ms": {
+                "mean": avg_overlap,
+                "std": std_overlap,
+                "samples": overlap_durations
+            },
+            "total_ms": {
+                "mean": avg_total,
+                "std": std_total,
+                "samples": total_durations
+            }
+        }
+    }
+    
+    if not use_wg_specialized and avg_producer > 0:
+        results["timing_results"]["overlap_percentage"] = (avg_overlap / avg_producer) * 100
+    
+    output_path = Path(args.output)
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"✓ Saved benchmark results to: {output_path}")
 
 if __name__ == "__main__":
     main()

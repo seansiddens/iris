@@ -11,6 +11,7 @@ def producer_kernel(
     NUM_ELEMENTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ENABLE_SPATIAL_FUSION: tl.constexpr,
+    barrier, 
 ):
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
@@ -23,8 +24,14 @@ def producer_kernel(
     if pid > 0:
         # Early exit all other workgroups
         return
+    
 
     tl.store(producer_xcd, xcd_id)
+
+    # Wait for both kernels to be ready
+    tl.atomic_add(barrier, 1)
+    while tl.atomic_cas(barrier, 2, 2) != 2:
+        pass
 
     num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)
     for tile_id in range(num_tiles):
@@ -55,6 +62,7 @@ def consumer_kernel(
     NUM_ELEMENTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ENABLE_SPATIAL_FUSION: tl.constexpr,
+    barrier
 ):
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
@@ -68,6 +76,12 @@ def consumer_kernel(
         return
 
     tl.store(consumer_xcd, xcd_id)
+
+
+    # Wait for both kernels to be ready
+    tl.atomic_add(barrier, 1)
+    while tl.atomic_cas(barrier, 2, 2) != 2:
+        pass
 
     num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)
 
