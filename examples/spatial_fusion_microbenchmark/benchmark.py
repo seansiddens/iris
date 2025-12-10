@@ -1,22 +1,36 @@
 import torch
 import torch.multiprocessing as mp
 import triton
-from spatial_fusion import producer_kernel, consumer_kernel
+import argparse
+from spatial_fusion import producer_kernel, consumer_kernel, workgroup_specialized_kernel
 
 def main():
+    parser = argparse.ArgumentParser(description='Benchmark producer-consumer kernels')
+    parser.add_argument('--spatial', action='store_true', 
+                        help='Enable spatial fusion')
+    parser.add_argument('--wg-specialized', action='store_true',
+                        help='Use workgroup specialized kernel (ignores --spatial flag)')
+    args = parser.parse_args()
+    
     datatype = torch.bfloat16
     block_size = 256
-    num_tiles = 1
+    num_tiles = 512
     buffer_size = block_size * num_tiles
     num_workgroups = 8
-    num_tiles_per_wg = triton.cdiv(num_tiles, num_workgroups)
     num_trials = 10
-    print(f"Buffer size: {buffer_size}, Num workgroups: {num_workgroups}, Tiles per WG: {num_tiles_per_wg}")
+    enable_spatial_fusion = args.spatial
+    use_wg_specialized = args.wg_specialized
+    print(f"Buffer size: {buffer_size}, Num workgroups: {num_workgroups}, Num tiles: {num_tiles}")
     print(f"Number of trials: {num_trials}")
+    if use_wg_specialized:
+        print(f"Using workgroup specialized kernel")
+        print(f"Spatial fusion: {'enabled (producer=pid0, consumer=pid8)' if enable_spatial_fusion else 'disabled (producer=pid0, consumer=pid1)'}")
+    else:
+        print(f"Spatial fusion: {'enabled' if enable_spatial_fusion else 'disabled'}")
 
     buffer = torch.rand(buffer_size, device="cuda", dtype=datatype)
     output_buffer = torch.zeros_like(buffer)
-    flag = torch.zeros(1, device="cuda", dtype=torch.int32)
+    flag = torch.zeros(num_tiles, device="cuda", dtype=torch.int32)
     flag.fill_(-1)
     producer_xcd = torch.zeros(1, device="cuda", dtype=torch.int32)
     producer_xcd.fill_(-1)
@@ -48,34 +62,57 @@ def main():
         # Record reference time
         reference_event.record()
 
-        # Launch producer kernel
-        torch.cuda.nvtx.range_push("Producer")
-        with torch.cuda.stream(producer_stream):
+        if use_wg_specialized:
+            # Launch workgroup specialized kernel with 16 workgroups
+            torch.cuda.nvtx.range_push("WorkgroupSpecialized")
             producer_start.record()
-            producer_kernel[(num_workgroups,)](
-                buffer=buffer,
-                lock=flag,
-                producer_xcd=producer_xcd,
-                NUM_ELEMENTS=buffer_size,
-                BLOCK_SIZE=block_size
-            )
-            producer_end.record()
-        torch.cuda.nvtx.range_pop()
-
-        # Launch consumer kernel
-        torch.cuda.nvtx.range_push("Consumer")
-        with torch.cuda.stream(consumer_stream):
-            consumer_start.record()
-            consumer_kernel[(num_workgroups,)](
+            workgroup_specialized_kernel[(16,)](
                 buffer=buffer,
                 output_buffer=output_buffer,
                 lock=flag,
+                producer_xcd=producer_xcd,
                 consumer_xcd=consumer_xcd,
                 NUM_ELEMENTS=buffer_size,
-                BLOCK_SIZE=block_size
+                BLOCK_SIZE=block_size,
+                ENABLE_SPATIAL_FUSION=enable_spatial_fusion
             )
+            producer_end.record()
+            torch.cuda.nvtx.range_pop()
+            
+            # For compatibility with timing logic, set consumer times to match producer
+            consumer_start.record()
             consumer_end.record()
-        torch.cuda.nvtx.range_pop()
+        else:
+            # Launch producer kernel
+            torch.cuda.nvtx.range_push("Producer")
+            with torch.cuda.stream(producer_stream):
+                producer_start.record()
+                producer_kernel[(num_workgroups,)](
+                    buffer=buffer,
+                    lock=flag,
+                    producer_xcd=producer_xcd,
+                    NUM_ELEMENTS=buffer_size,
+                    BLOCK_SIZE=block_size,
+                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion
+                )
+                producer_end.record()
+            torch.cuda.nvtx.range_pop()
+
+            # Launch consumer kernel
+            torch.cuda.nvtx.range_push("Consumer")
+            with torch.cuda.stream(consumer_stream):
+                consumer_start.record()
+                consumer_kernel[(num_workgroups,)](
+                    buffer=buffer,
+                    output_buffer=output_buffer,
+                    lock=flag,
+                    consumer_xcd=consumer_xcd,
+                    NUM_ELEMENTS=buffer_size,
+                    BLOCK_SIZE=block_size,
+                    ENABLE_SPATIAL_FUSION=enable_spatial_fusion
+                )
+                consumer_end.record()
+            torch.cuda.nvtx.range_pop()
 
         # Wait for both kernels to complete
         torch.cuda.synchronize()
@@ -94,25 +131,35 @@ def main():
         print(f"\n{'='*60}")
         print(f"Kernel Timing Information")
         print(f"{'='*60}")
-        print(f"Producer:  start={prod_start_ms:.3f}ms, end={prod_end_ms:.3f}ms, duration={prod_end_ms-prod_start_ms:.3f}ms")
-        print(f"Consumer:  start={cons_start_ms:.3f}ms, end={cons_end_ms:.3f}ms, duration={cons_end_ms-cons_start_ms:.3f}ms")
+        
+        if use_wg_specialized:
+            kernel_duration = prod_end_ms - prod_start_ms
+            print(f"Workgroup Specialized Kernel: duration={kernel_duration:.3f}ms")
+            # Store timing results
+            producer_durations.append(kernel_duration)
+            consumer_durations.append(0)
+            overlap_durations.append(0)
+            total_durations.append(kernel_duration)
+        else:
+            print(f"Producer:  start={prod_start_ms:.3f}ms, end={prod_end_ms:.3f}ms, duration={prod_end_ms-prod_start_ms:.3f}ms")
+            print(f"Consumer:  start={cons_start_ms:.3f}ms, end={cons_end_ms:.3f}ms, duration={cons_end_ms-cons_start_ms:.3f}ms")
 
-        # Check for overlap
-        overlap_start = max(prod_start_ms, cons_start_ms)
-        overlap_end = min(prod_end_ms, cons_end_ms)
-        overlap_ms = max(0, overlap_end - overlap_start)
-        total_time = max(prod_end_ms, cons_end_ms) - min(prod_start_ms, cons_start_ms)
+            # Check for overlap
+            overlap_start = max(prod_start_ms, cons_start_ms)
+            overlap_end = min(prod_end_ms, cons_end_ms)
+            overlap_ms = max(0, overlap_end - overlap_start)
+            total_time = max(prod_end_ms, cons_end_ms) - min(prod_start_ms, cons_start_ms)
 
-        # Store timing results
-        producer_durations.append(prod_end_ms - prod_start_ms)
-        consumer_durations.append(cons_end_ms - cons_start_ms)
-        overlap_durations.append(overlap_ms)
-        total_durations.append(total_time)
+            # Store timing results
+            producer_durations.append(prod_end_ms - prod_start_ms)
+            consumer_durations.append(cons_end_ms - cons_start_ms)
+            overlap_durations.append(overlap_ms)
+            total_durations.append(total_time)
 
-        print(f"\nOverlap:   {overlap_ms:.3f}ms")
-        print(f"Total:     {total_time:.3f}ms")
-        if prod_end_ms - prod_start_ms > 0:
-            print(f"Overlap %: {overlap_ms/(prod_end_ms-prod_start_ms)*100:.1f}% of producer")
+            print(f"\nOverlap:   {overlap_ms:.3f}ms")
+            print(f"Total:     {total_time:.3f}ms")
+            if prod_end_ms - prod_start_ms > 0:
+                print(f"Overlap %: {overlap_ms/(prod_end_ms-prod_start_ms)*100:.1f}% of producer")
         print(f"{'='*60}\n")
 
     # Warmup
@@ -148,12 +195,16 @@ def main():
     print(f"\n{'='*60}")
     print(f"Average Results over {num_trials} trials")
     print(f"{'='*60}")
-    print(f"Producer:  {avg_producer:.3f} ± {std_producer:.3f} ms")
-    print(f"Consumer:  {avg_consumer:.3f} ± {std_consumer:.3f} ms")
-    print(f"Overlap:   {avg_overlap:.3f} ± {std_overlap:.3f} ms")
-    print(f"Total:     {avg_total:.3f} ± {std_total:.3f} ms")
-    if avg_producer > 0:
-        print(f"Overlap %: {avg_overlap/avg_producer*100:.1f}% of producer")
+    if use_wg_specialized:
+        print(f"Workgroup Specialized Kernel: {avg_producer:.3f} ± {std_producer:.3f} ms")
+        print(f"Total:                        {avg_total:.3f} ± {std_total:.3f} ms")
+    else:
+        print(f"Producer:  {avg_producer:.3f} ± {std_producer:.3f} ms")
+        print(f"Consumer:  {avg_consumer:.3f} ± {std_consumer:.3f} ms")
+        print(f"Overlap:   {avg_overlap:.3f} ± {std_overlap:.3f} ms")
+        print(f"Total:     {avg_total:.3f} ± {std_total:.3f} ms")
+        if avg_producer > 0:
+            print(f"Overlap %: {avg_overlap/avg_producer*100:.1f}% of producer")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":

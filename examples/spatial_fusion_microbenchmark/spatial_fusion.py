@@ -10,12 +10,15 @@ def producer_kernel(
     producer_xcd,
     NUM_ELEMENTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_SPATIAL_FUSION: tl.constexpr,
 ):
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
 
     # Enable spatial fusion
-    pid = ((pid - 1) + 8) % 8
+    if ENABLE_SPATIAL_FUSION:
+        pid = ((pid - 2) + 8) % 8
+        # pid = pid
 
     if pid > 0:
         # Early exit all other workgroups
@@ -33,7 +36,7 @@ def producer_kernel(
         x = tl.load(buffer + offsets, mask=mask)
 
         # tl.store(buffer + offsets, x+x, mask=mask, cache_modifier=".wt")
-        tl.store(buffer + offsets, x, mask=mask, cache_modifier=".cg")
+        tl.store(buffer + offsets, x, mask=mask, cache_modifier=".cg", eviction_policy="evict_last")
         # tl.store(buffer + offsets, x+x, mask=mask)
 
         tl.debug_barrier()
@@ -50,11 +53,15 @@ def consumer_kernel(
     lock,
     consumer_xcd,
     NUM_ELEMENTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr, 
-
+    BLOCK_SIZE: tl.constexpr,
+    ENABLE_SPATIAL_FUSION: tl.constexpr,
 ):
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
+
+    # Enable spatial fusion
+    if ENABLE_SPATIAL_FUSION:
+        pid = ((pid - 1) + 8) % 8
 
     if pid > 0:
         # Early exit all other workgroups
@@ -90,16 +97,25 @@ def workgroup_specialized_kernel(
     consumer_xcd,
     NUM_ELEMENTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_SPATIAL_FUSION: tl.constexpr,
 ):
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
 
-    # Early exit for all pids except 0 and 8
-    if pid != 0 and pid != 8:
+    # Determine producer and consumer pids based on spatial fusion flag
+    if ENABLE_SPATIAL_FUSION:
+        producer_pid = 0
+        consumer_pid = 8
+    else:
+        producer_pid = 0
+        consumer_pid = 1
+
+    # Early exit for all pids except producer and consumer
+    if pid != producer_pid and pid != consumer_pid:
         return
 
-    # pid 0 executes producer logic
-    if pid == 0:
+    # Producer logic
+    if pid == producer_pid:
         tl.store(producer_xcd, xcd_id)
 
         num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)
@@ -117,8 +133,8 @@ def workgroup_specialized_kernel(
 
             tl.atomic_xchg(lock + tile_id, 1)
 
-    # pid 8 executes consumer logic
-    elif pid == 8:
+    # Consumer logic
+    elif pid == consumer_pid:
         tl.store(consumer_xcd, xcd_id)
 
         num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)

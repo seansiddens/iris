@@ -87,6 +87,7 @@ def main():
     kernel_names = [
         "producer_kernel",
         "consumer_kernel",
+        "workgroup_specialized_kernel",
     ]
     
     print(f"Analyzing L2 hit rates for kernels: {', '.join(kernel_names)}")
