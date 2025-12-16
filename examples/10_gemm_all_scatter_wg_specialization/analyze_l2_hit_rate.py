@@ -33,13 +33,24 @@ def parse_csv(csv_path: Path, kernel_names: List[str]) -> Dict[str, List[Tuple[f
         correlation_data: Dict[Tuple[str, str], Dict[str, float]] = {}
         
         for row in reader:
+            # Skip rows with missing or invalid data
+            if not row.get('Kernel_Name') or not row.get('Counter_Value'):
+                continue
+            
             kernel = row['Kernel_Name']
             if kernel not in kernel_set:
                 continue
 
             corr_id = row['Correlation_Id']
             counter_name = row['Counter_Name']
-            counter_value = float(row['Counter_Value'])
+            
+            # Try to convert Counter_Value to float, skip if it fails
+            try:
+                counter_value = float(row['Counter_Value'])
+            except (ValueError, TypeError):
+                # Skip rows where Counter_Value is not a valid number (e.g., "Agent 2")
+                continue
+            
             key = (kernel, corr_id)
             
             if key not in correlation_data:

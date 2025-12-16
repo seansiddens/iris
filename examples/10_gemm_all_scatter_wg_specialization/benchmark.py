@@ -46,14 +46,14 @@ def parse_args():
         description="Parse matrix dimensions and configuration.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # parser.add_argument("-m", type=int, default=8192*2, help="Number of rows in matrix A")
+    parser.add_argument("-m", type=int, default=8192, help="Number of rows in matrix A")
     # parser.add_argument("-m", type=int, default=3584, help="Number of rows in matrix A")
-    parser.add_argument("-m", type=int, default=8192*4, help="Number of rows in matrix A")
+    # parser.add_argument("-m", type=int, default=8192*4, help="Number of rows in matrix A")
     # parser.add_argument("-n", type=int, default=2048, help="Number of columns in matrix B")
-    # parser.add_argument("-n", type=int, default=4096, help="Number of columns in matrix B")
-    parser.add_argument("-n", type=int, default=4096*4, help="Number of columns in matrix B")
-    parser.add_argument("-k", type=int, default=36864*1, help="Common dimension between matrices A and B")
-    # parser.add_argument("-k", type=int, default=4096, help="Common dimension between matrices A and B")
+    parser.add_argument("-n", type=int, default=4096, help="Number of columns in matrix B")
+    # parser.add_argument("-n", type=int, default=4096*4, help="Number of columns in matrix B")
+    # parser.add_argument("-k", type=int, default=36864*1, help="Common dimension between matrices A and B")
+    parser.add_argument("-k", type=int, default=4096, help="Common dimension between matrices A and B")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
     parser.add_argument("-t", "--trace_tiles", action="store_true", help="Enable tile-tracing mode")
@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--kernel_variant",
         type=str,
-        default="spatial",
+        default="baseline",
         choices=["baseline", "spatial"],
         help="Choose between baseline and spatial workgroup specialization",
     )
@@ -169,6 +169,9 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     total_blocks_N = triton.cdiv(args["n"], args["BLK_N"])
     total_tiles = total_blocks_M * total_blocks_N
     print(f"Total tiles: {total_tiles}, total_blocks_M: {total_blocks_M}, total_blocks_N: {total_blocks_N}")
+    json_writer.add_field("total_blocks_M", total_blocks_M)
+    json_writer.add_field("total_blocks_N", total_blocks_N)
+    json_writer.add_field("total_tiles", total_tiles)
 
     if args["show_map"]:
         gemm_map_wgid = torch.empty(total_tiles, device="cuda", dtype=torch.int64)
@@ -181,7 +184,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         comm_map_wgid = None
         comm_map_xcd = None
 
-    locks = shmem.zeros((total_tiles,), device="cuda", dtype=torch.int8)
+    locks = shmem.zeros((total_tiles,), device="cuda", dtype=torch.int32)
 
     bias = None
 
