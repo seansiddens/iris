@@ -233,7 +233,9 @@ def malloc_fine_grained(size):
 
     if _is_amd_backend:
         hipDeviceMallocFinegrained = 0x1
+        hipDeviceMallocUncached = 0x3
         gpu_try(gpu_runtime.hipExtMallocWithFlags(ctypes.byref(ptr), size, hipDeviceMallocFinegrained))
+        # gpu_try(gpu_runtime.hipExtMallocWithFlags(ctypes.byref(ptr), size, hipDeviceMallocUncached))
     else:
         # CUDA doesn't have direct equivalent, use regular malloc
         gpu_try(gpu_runtime.cudaMalloc(ctypes.byref(ptr), size))

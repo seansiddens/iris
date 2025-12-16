@@ -84,7 +84,8 @@ def main():
         sys.exit(1)
     
     kernel_names = [
-        "persistent_all_scatter"
+        "persistent_all_scatter",
+        "persistent_all_scatter_spatial"
     ]
     
     print(f"Analyzing L2 hit rates for kernels: {', '.join(kernel_names)}")

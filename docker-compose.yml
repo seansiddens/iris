@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     image: iris-dev:latest
-    container_name: iris-dev
+    container_name: iris-dev-ssiddens
     network_mode: "host"
     devices:
       - /dev/kfd

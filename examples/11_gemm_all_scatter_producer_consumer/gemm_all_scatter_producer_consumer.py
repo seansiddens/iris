@@ -243,9 +243,9 @@ def persistent_gemm_spatial(
     pid = tl.program_id(0)
     xcd_id = read_xcd_id()
 
-    # First workgroup signals its XCD ID to the scatter kernel
-    if pid == 0:
-        tl.store(gemm_xcd_flag, xcd_id, cache_modifier=".wt")
+    # # First workgroup signals its XCD ID to the scatter kernel
+    # if pid == 0:
+    #     tl.store(gemm_xcd_flag, xcd_id, cache_modifier=".wt")
 
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (GEMM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
@@ -338,10 +338,10 @@ def persistent_gemm_spatial(
             tl.atomic_max(mm_end_timestamp_ptr + tile_id, timestamp)
 
         # tl.store(C + global_offset, c, mask=sub_mask, cache_modifier=".wt")
-        tl.store(C + global_offset, c, mask=sub_mask)
-        tl.debug_barrier()
+        tl.store(C + global_offset, c, mask=sub_mask, eviction_policy="evict_last", cache_modifier=".cg")
+        tl.debug_barrier() # Is this flushing/evicting?
         # tl.store(locks + tile_id, 1, cache_modifier=".wt")
-        tl.store(locks + tile_id, 1)
+        tl.store(locks + tile_id, 1, eviction_policy="evict_last", cache_modifier=".cg")
 
 
 @triton.jit()
@@ -373,9 +373,9 @@ def persistent_all_scatter_spatial(
 
     # Wait for GEMM kernel to signal its XCD ID (initialized to -1)
     # Load once to get the proper type, then loop
-    gemm_xcd_start = tl.load(gemm_xcd_flag, cache_modifier=".cv", volatile=True)
-    while gemm_xcd_start == -1:
-        gemm_xcd_start = tl.load(gemm_xcd_flag, cache_modifier=".cv", volatile=True)
+    # gemm_xcd_start = tl.load(gemm_xcd_flag, cache_modifier=".cv", volatile=True)
+    # while gemm_xcd_start == -1:
+    #     gemm_xcd_start = tl.load(gemm_xcd_flag, cache_modifier=".cv", volatile=True)
 
     # Remap PID to align with GEMM kernel's XCD mapping
     # Calculate the XCD offset between scatter and GEMM kernels
@@ -424,10 +424,14 @@ def persistent_all_scatter_spatial(
             global_offset = rm[:, None] * stride_cm_global + (rn[None, :] + cur_rank * N) * stride_cn_global
             # End: masks/offset calculations.
 
-            # while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
-            #     pass
-            while tl.load(locks + tile_id) != 1:
+            while tl.load(locks + tile_id, cache_modifier=".cv", volatile=True) != 1:
                 pass
+
+            # while tl.load(locks + tile_id) != 1:
+            #     pass
+            
+            # while tl.atomic_cas(locks + tile_id, 1, 1, sem="acquire", scope="gpu") != 1:
+            #     pass
 
             for remote_rank in range(world_size):
                 if remote_rank != cur_rank:

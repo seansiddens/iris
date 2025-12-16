@@ -17,8 +17,8 @@ def producer_kernel(
     xcd_id = read_xcd_id()
 
     # Enable spatial fusion
-    if ENABLE_SPATIAL_FUSION:
-        pid = ((pid - 2) + 8) % 8
+    if not ENABLE_SPATIAL_FUSION:
+        pid = ((pid - 1) + 8) % 8
         # pid = pid
 
     if pid > 0:
@@ -30,8 +30,12 @@ def producer_kernel(
 
     # Wait for both kernels to be ready
     tl.atomic_add(barrier, 1)
-    while tl.atomic_cas(barrier, 2, 2) != 2:
+    tl.debug_barrier()
+    # while tl.atomic_cas(barrier, 2, 2) != 2:
+    #     pass
+    while tl.load(barrier, volatile=True) < 2:
         pass
+    tl.debug_barrier()
 
     num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)
     for tile_id in range(num_tiles):
@@ -68,8 +72,8 @@ def consumer_kernel(
     xcd_id = read_xcd_id()
 
     # Enable spatial fusion
-    if ENABLE_SPATIAL_FUSION:
-        pid = ((pid - 1) + 8) % 8
+    # if ENABLE_SPATIAL_FUSION:
+    #     pid = ((pid - 1) + 8) % 8
 
     if pid > 0:
         # Early exit all other workgroups
@@ -80,8 +84,10 @@ def consumer_kernel(
 
     # Wait for both kernels to be ready
     tl.atomic_add(barrier, 1)
+    tl.debug_barrier()
     while tl.atomic_cas(barrier, 2, 2) != 2:
         pass
+    tl.debug_barrier()
 
     num_tiles = tl.cdiv(NUM_ELEMENTS, BLOCK_SIZE)
 

@@ -44,9 +44,9 @@ def parse_args():
         description="Parse matrix dimensions and configuration.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-m", type=int, default=8192, help="Number of rows in matrix A")
-    parser.add_argument("-n", type=int, default=4608, help="Number of columns in matrix B")
-    parser.add_argument("-k", type=int, default=36864, help="Common dimension between matrices A and B")
+    parser.add_argument("-m", type=int, default=1024, help="Number of rows in matrix A")
+    parser.add_argument("-n", type=int, default=2048, help="Number of columns in matrix B")
+    parser.add_argument("-k", type=int, default=256, help="Common dimension between matrices A and B")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation mode")
     parser.add_argument("-t", "--trace_tiles", action="store_true", help="Enable tile-tracing mode")

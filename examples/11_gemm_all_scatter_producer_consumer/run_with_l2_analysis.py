@@ -32,7 +32,10 @@ def parse_rocprof_csv(csv_path: Path, kernel_names: List[str]) -> Dict[str, Dict
         Dict mapping kernel name to stats dict with 'hits', 'misses', 'hit_rate'
     """
     kernel_set = set(kernel_names)
-    kernel_stats: Dict[str, Dict[str, float]] = {k: {'hits': 0, 'misses': 0, 'invocations': 0} for k in kernel_names}
+    kernel_stats: Dict[str, Dict[str, float]] = {
+        k: {'hits': 0, 'misses': 0, 'invocations': 0, 'l2_cache_hit_values': []} 
+        for k in kernel_names
+    }
     
     if not csv_path.exists():
         return kernel_stats
@@ -64,11 +67,21 @@ def parse_rocprof_csv(csv_path: Path, kernel_names: List[str]) -> Dict[str, Dict
                 kernel_stats[kernel]['hits'] += counters['TCC_HIT_sum']
                 kernel_stats[kernel]['misses'] += counters['TCC_MISS_sum']
                 kernel_stats[kernel]['invocations'] += 1
+            
+            # Collect L2CacheHit values
+            if 'L2CacheHit' in counters:
+                kernel_stats[kernel]['l2_cache_hit_values'].append(counters['L2CacheHit'])
     
-    # Calculate hit rates
+    # Calculate hit rates and average L2CacheHit
     for kernel, stats in kernel_stats.items():
         total = stats['hits'] + stats['misses']
         stats['hit_rate'] = (stats['hits'] / total * 100.0) if total > 0 else 0.0
+        
+        # Calculate average L2CacheHit
+        if stats['l2_cache_hit_values']:
+            stats['avg_l2_cache_hit'] = sum(stats['l2_cache_hit_values']) / len(stats['l2_cache_hit_values'])
+        else:
+            stats['avg_l2_cache_hit'] = None
     
     return kernel_stats
 
@@ -223,6 +236,11 @@ def display_combined_results(
                 print(f"    Total Hits: {stats['hits']:,.0f}")
                 print(f"    Total Misses: {stats['misses']:,.0f}")
                 print(f"    L2 Hit Rate: {stats['hit_rate']:.2f}%")
+                
+                # Display L2CacheHit if available
+                avg_l2_cache_hit = stats.get('avg_l2_cache_hit')
+                if avg_l2_cache_hit is not None:
+                    print(f"    L2 Cache Hit (avg): {avg_l2_cache_hit:.4f}")
     else:
         print("\nL2 Cache Statistics:")
         print("-" * 80)
@@ -277,7 +295,7 @@ Examples:
                        help="Kernel variant to use")
     parser.add_argument("-b", "--benchmark", action="store_true", help="Enable benchmarking")
     parser.add_argument("-v", "--validate", action="store_true", help="Enable validation")
-    parser.add_argument("--show_map", action="store_true", help="Show XCD mapping")
+    parser.add_argument("--show_map", action="store_true", help="Show XCD mapping (requires --validate)")
     parser.add_argument("--BLK_M", type=int, help="Block size M")
     parser.add_argument("--BLK_N", type=int, help="Block size N")
     parser.add_argument("--BLK_K", type=int, help="Block size K")
@@ -286,6 +304,11 @@ Examples:
     parser.add_argument("-r", "--num_ranks", type=int, help="Number of ranks")
     
     args = parser.parse_args()
+    
+    # Auto-enable validation if show_map is requested
+    if args.show_map and not args.validate:
+        print("Note: --show_map requires validation, enabling --validate automatically\n")
+        args.validate = True
     
     # Build benchmark arguments
     benchmark_args = ["--output_file", args.output_json]
